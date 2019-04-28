@@ -12,7 +12,7 @@ from torch.distributions import Normal
 from tensorboardX import SummaryWriter
 import os
 import torch.nn.functional as F
-
+import time
 
 def weight_init(m):
     if isinstance(m, nn.Linear):
@@ -111,7 +111,10 @@ class EnvManager:
     def __init__(self, env_name, num_envs, num_steps):
         self.envs = [gym.make(env_name) for _ in range(num_envs)]
 
-        obs_size = self.envs[0].observation_space.spaces['observation'].shape[0]
+        # obs_size = self.envs[0].observation_space.spaces['observation'].shape[0]
+        # action_size = self.envs[0].action_space.shape[0]
+
+        obs_size = self.envs[0].observation_space.shape[0]
         action_size = self.envs[0].action_space.shape[0]
 
         self.terminal_n = torch.zeros(num_steps + 1, num_envs, 1)
@@ -180,7 +183,8 @@ class EnvManager:
 
 
 def proc_state(x):
-    return torch.FloatTensor(x["observation"])
+    # x = x["observation"]
+    return torch.FloatTensor(x)
 
 
 class A2C(object):
@@ -202,7 +206,7 @@ class A2C(object):
 
         action_out, value_out = self.actor_critic.forward(self.manager.state_n[:-1].view((-1, self.manager.obs_size)))
 
-        value_loss = F.mse_loss(self.actor_critic.value(self.manager.state_n), self.manager.value_pred_n)
+        value_loss = F.mse_loss(value_out, returns.view(-1, 1))
         action_loss = - torch.mean(
             action_out.log_prob(self.manager.action_n.view((-1, self.manager.action_size))) * returns.view((-1, 1)))
 
@@ -228,6 +232,7 @@ class A2C(object):
         while not terminal:
             if render:
                 self.eval_env.render()
+                time.sleep(0.01)
             with torch.no_grad():
                 action = self.actor_critic.act(state.view((1, -1))).numpy().reshape((-1,))
             next_state, reward, terminal, info = self.eval_env.step(action)
@@ -237,15 +242,9 @@ class A2C(object):
             rewards.append(reward)
             state = next_state
 
-        return torch.tensor(rewards).unsqueeze(1)
+        self.eval_env.close()
 
-    def compute_gt(self, states, rewards):
-        episode_len = len(states)
-        Gt = torch.zeros((episode_len, 1))
-        discounts = torch.pow(self.gamma, torch.arange(0, episode_len, dtype=torch.float32))
-        for t in range(episode_len):
-            Gt[t] = torch.sum(rewards[t:] * discounts.view(-1, 1)[0:episode_len - t])
-        return Gt
+        return torch.tensor(rewards).unsqueeze(1)
 
     def eval(self, n=100, render=False):
         returns = []
@@ -284,16 +283,26 @@ def parse_arguments():
 
 
 def train(args):
-    env_name = 'FetchPushDense-v1'
+    env_name = 'MountainCarContinuous-v0'
     env = gym.make(env_name)
-    model = ActorCritic(env.observation_space.spaces['observation'].shape[0], env.action_space.shape[0])
+    # obs_size = env.observation_space.spaces['observation'].shape[0]
+    # action_size = env.action_space.shape[0]
+
+    obs_size = env.observation_space.shape[0]
+    action_size = env.action_space.shape[0]
+
+    model = ActorCritic(obs_size, action_size)
     runner = A2C(env_name, model, args)
 
     for u in range(1, args.num_updates):
-        print("{}/{}".format(u, args.num_updates))
+        # print("{}/{}".format(u, args.num_updates))
         runner.train_step()
         if u % args.checkpt == 0:
-            print(runner.eval(100))
+            print(model.policy.log_std)
+
+            runner.eval(1, render=True)
+            print(runner.eval(100 ))
+
     #
     # return
     # model.apply(weight_init)
