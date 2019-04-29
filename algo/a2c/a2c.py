@@ -30,7 +30,16 @@ class ActorCritic(nn.Module):
         self.critic = Critic(self.hidden_size)
         self.policy = Policy(self.hidden_size, action_space)
 
-        self.base_net = nn.Sequential(
+        self.base_net1 = nn.Sequential(
+            nn.Linear(observation_space, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU()
+        )
+
+        self.base_net2 = nn.Sequential(
             nn.Linear(observation_space, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
@@ -40,17 +49,19 @@ class ActorCritic(nn.Module):
         )
 
     def forward(self, x):
-        z = self.base_net(x)
-        policy_out = self.policy(z)
-        critic_out = self.critic(z)
+        z1 = self.base_net1(x)
+        z2 = self.base_net2(x)
+
+        policy_out = self.policy(z1)
+        critic_out = self.critic(z2)
         return policy_out, critic_out
 
     def value(self, x):
-        return self.critic(self.base_net(x))
+        return self.critic(self.base_net2(x))
 
     def act(self, x):
         with torch.no_grad():
-            action = self.policy(self.base_net(x)).sample()
+            action = self.policy(self.base_net1(x)).sample()
         return action
 
 
@@ -64,15 +75,19 @@ class Critic(nn.Module):
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
             nn.Linear(64, 1)
         )
 
     def forward(self, input_x):
         return self.net(input_x)
+
+
+
+
+def init(module, weight_init, bias_init, gain=1):
+    weight_init(module.weight.data, gain=gain)
+    bias_init(module.bias.data)
+    return module
 
 
 class Policy(nn.Module):
@@ -87,16 +102,18 @@ class Policy(nn.Module):
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, self.action_space)
         )
+
+        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
+                               constant_(x, 0))
+
+        self.action_mean = init_(nn.Linear(64, self.action_space))
+
         self.log_std = nn.Parameter(torch.zeros(self.action_space))
 
     def forward(self, input_x):
-        loc = self.net(input_x)
+        z = self.net(input_x)
+        loc = self.action_mean(z)
         sigma = torch.exp(self.log_std)
         return Normal(loc=loc, scale=sigma)
 
@@ -160,24 +177,14 @@ class EnvManager:
 
         self.t += 1
 
-    def compute_returns(self, actor_critic, gamma, gae_lambda, use_gae=True):
-        returns = torch.zeros(self.num_steps, self.num_envs, 1)
+    def compute_returns(self, actor_critic, gamma):
+        returns = torch.zeros(self.num_steps+1, self.num_envs, 1)
 
         with torch.no_grad():
             next_value = actor_critic.value(self.state_n[-1])
-
-            if use_gae:
-                self.value_pred_n[-1] = next_value
-                gae = 0
-                for step in reversed(range(self.reward_n.size(0))):
-                    delta = self.reward_n[step] + gamma * self.value_pred_n[step + 1] * self.terminal_n[step + 1] - \
-                            self.value_pred_n[step]
-                    gae = delta + gamma * gae_lambda * self.terminal_n[step + 1] * gae
-                    returns[step] = gae + self.value_pred_n[step]
-            else:
-                returns[-1] = next_value
-                for step in reversed(range(self.reward_n.size(0))):
-                    returns[step] = (returns[step + 1] * gamma * self.terminal_n[step + 1] + self.reward_n[step])
+            returns[-1] = next_value
+            for step in reversed(range(self.reward_n.size(0))):
+                returns[step] = (returns[step + 1] * gamma * (1 - self.terminal_n[step + 1]) + self.reward_n[step])
 
         return returns
 
@@ -192,34 +199,46 @@ class A2C(object):
     def __init__(self, env_name, actor_critic, args):
         self.args = args
         self.actor_critic = actor_critic
-        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=self.args.lr)
+        self.optimizer = optim.RMSprop(self.actor_critic.parameters(), lr=self.args.lr, alpha=0.99, eps=1e-5)
         self.eval_env = gym.make(env_name)
         self.manager = EnvManager(env_name, args.num_workers, args.num_steps)
         self.num_steps = args.num_steps
+        self.lr_scheduler = optim.lr_scheduler.LambdaLR
 
     def forward(self):
 
         for t in range(self.num_steps):
             self.manager.step(self.actor_critic)
 
-        returns = self.manager.compute_returns(self.actor_critic, self.args.gamma, self.args.gae_lambda)
-
+        returns = self.manager.compute_returns(self.actor_critic, self.args.gamma)
         action_out, value_out = self.actor_critic.forward(self.manager.state_n[:-1].view((-1, self.manager.obs_size)))
 
-        value_loss = F.mse_loss(value_out, returns.view(-1, 1))
-        action_loss = - torch.mean(
-            action_out.log_prob(self.manager.action_n.view((-1, self.manager.action_size))) * returns.view((-1, 1)))
+        advantages = returns[:-1] - value_out.view(self.args.num_steps, self.args.num_workers, 1)
 
-        loss = 0.5 * value_loss + 0.5 * action_loss
-        return loss
+        value_loss = advantages.pow(2).mean()
 
-    def train_step(self):
+        policy_entropy = action_out.entropy().mean()
+
+        action_log_probs = action_out.log_prob(self.manager.action_n.view((-1, self.manager.action_size))).view(self.args.num_steps, self.args.num_workers, 1)
+        action_loss = - torch.mean(advantages.detach() * action_log_probs)
+
+        return value_loss, action_loss, -policy_entropy
+
+    def train_step(self, warmup=False):
 
         self.optimizer.zero_grad()
-        loss = self.forward()
-        loss.backward()
+        value_loss, action_loss, entropy_loss = self.forward()
+
+        if warmup:
+            value_loss.backward()
+        else:
+            (0.5 * value_loss + action_loss + 0.05 * entropy_loss).backward()
+
+        nn.utils.clip_grad_norm_(self.actor_critic.parameters(), 0.5)
         self.optimizer.step()
         self.manager.reset()
+
+        return value_loss.item(), action_loss.item(), entropy_loss.item()
 
 
     def generate_episode(self, render=False):
@@ -253,10 +272,6 @@ class A2C(object):
             returns.append(torch.sum(rewards).item())
         return np.mean(returns), np.max(returns), np.std(returns)
 
-    def lr_step(self):
-        self.lr_scheduler.step()
-
-
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--num-updates', type=int,
@@ -274,7 +289,7 @@ def parse_arguments():
     parser.add_argument('--checkpt', type=float,
                         default=5, help="Checkpoint frequency")
     parser.add_argument('--resume', type=str,
-                        default='', help="Checkpoint file name to resume from")
+                        default=None, help="Checkpoint file name to resume from")
     parser.add_argument('--render',
                         action='store_true', default=False,
                         help="Whether to render the environment.")
@@ -283,6 +298,9 @@ def parse_arguments():
 
 
 def train(args):
+
+    writer = SummaryWriter(comment='_a2c_')
+
     env_name = 'MountainCarContinuous-v0'
     env = gym.make(env_name)
     # obs_size = env.observation_space.spaces['observation'].shape[0]
@@ -295,71 +313,35 @@ def train(args):
     runner = A2C(env_name, model, args)
 
     for u in range(1, args.num_updates):
-        # print("{}/{}".format(u, args.num_updates))
-        runner.train_step()
+
+        total_num_steps = u * args.num_workers * args.num_steps
+        value_loss, action_loss, entropy_loss = runner.train_step(warmup=False)
+
+        writer.add_scalar('value_loss', value_loss, total_num_steps)
+        writer.add_scalar('action_loss', action_loss, total_num_steps)
+        writer.add_scalar('entropy_loss', entropy_loss, total_num_steps)
+
         if u % args.checkpt == 0:
-            print(model.policy.log_std)
 
-            runner.eval(1, render=True)
-            print(runner.eval(100 ))
+            mean_eval_return, max_eval_return, std_eval_return = runner.eval(20)
+            writer.add_scalar('eval_mean_return', mean_eval_return, total_num_steps)
+            writer.add_scalar('eval_max_return', max_eval_return, total_num_steps)
+            writer.add_scalar('eval_std_return', std_eval_return, total_num_steps)
 
-    #
-    # return
-    # model.apply(weight_init)
-    # writer = SummaryWriter(comment='_reinforce_')
-    # num_episodes = args.num_episodes
-    # lr = args.lr
-    # gamma = args.gamma
-    # render = args.render
-    # trainer = A2C('FetchPushDense-v1', args.num_workers, model, args, lr, gamma)
-    #
-    # start_epoch = 0
-    # if args.resume != '':
-    #     if os.path.isfile(args.resume):
-    #         print("=> loading checkpoint '{}'".format(args.resume))
-    #         checkpoint = torch.load(args.resume)
-    #         start_epoch = checkpoint['epoch']
-    #         trainer.policy.load_state_dict(checkpoint['state_dict'])
-    #         trainer.optimizer.load_state_dict(checkpoint['optimizer'])
-    #         print("=> loaded checkpoint '{}' (epoch {})"
-    #               .format(args.resume, checkpoint['epoch']))
-    #     else:
-    #         print("=> no checkpoint found at '{}'".format(args.resume))
-    #
-    # rewards_per_episode = []
-    # loss_per_episode = []
-    # steps_per_episode = []
-    #
-    # for epi in range(start_epoch, num_episodes):
-    #
-    #     epi_rewards, epi_loss, len_epi = trainer.train(env)
-    #     rewards_per_episode.append(epi_rewards)
-    #     loss_per_episode.append(epi_loss)
-    #     steps_per_episode.append(len_epi)
-    #
-    #     if (epi + 1) % args.checkpt == 0:
-    #         torch.save({'epoch': epi + 1,
-    #                     'state_dict': trainer.actor_critic.state_dict(),
-    #                     'optimizer': trainer.optimizer.state_dict(),
-    #                     }, "checkpoint.pt")
-    #
-    #         mean_episode_reward = np.mean(rewards_per_episode)
-    #         std_episode_reward = np.std(rewards_per_episode)
-    #         mean_episode_loss = np.mean(loss_per_episode)
-    #         avg_steps = np.mean(steps_per_episode)
-    #         eval_mean_episode_return, eval_max_episode_return, eval_std_episode_return = trainer.eval()
-    #         print('Episode: {}, Eval return: {}'.format(epi, eval_mean_episode_return))
-    #         writer.add_scalar('data/mean_episode_reward', mean_episode_reward, epi)
-    #         writer.add_scalar('data/std_episode_reward', std_episode_reward, epi)
-    #         writer.add_scalar('data/mean_episode_loss', mean_episode_loss, epi)
-    #         writer.add_scalar('data/eval_mean_episode_return', eval_mean_episode_return, epi)
-    #         writer.add_scalar('data/eval_std_episode_return', eval_std_episode_return, epi)
-    #         writer.add_scalar('data/avg_steps', avg_steps, epi)
-    #
-    #         rewards_per_episode = []
-    #         loss_per_episode = []
-    #         steps_per_episode = []
-    #
+            torch.save({'state_dict': runner.actor_critic.state_dict(),
+                        'optimizer': runner.optimizer.state_dict(),
+                        }, "a2c_checkpoint.pt")
+
+        if args.resume:
+            if os.path.isfile(args.resume):
+                print("=> loading checkpoint '{}'".format(args.resume))
+                checkpoint = torch.load(args.resume)
+                model.load_state_dict(checkpoint['state_dict'])
+                runner.optimizer.load_state_dict(checkpoint['optimizer'])
+                print("=> loaded checkpoint '{}' (epoch {})"
+                      .format(args.resume, checkpoint['epoch']))
+            else:
+                print("=> no checkpoint found at '{}'".format(args.resume))
 
 if __name__ == '__main__':
     # Parse command-line arguments.
