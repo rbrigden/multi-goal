@@ -232,7 +232,7 @@ class A2C(object):
         if warmup:
             value_loss.backward()
         else:
-            (0.5 * value_loss + action_loss + 0.05 * entropy_loss).backward()
+            (0.5 * value_loss + action_loss + 0.01 * entropy_loss).backward()
 
         nn.utils.clip_grad_norm_(self.actor_critic.parameters(), 0.5)
         self.optimizer.step()
@@ -301,7 +301,7 @@ def train(args):
 
     writer = SummaryWriter(comment='_a2c_')
 
-    env_name = 'MountainCarContinuous-v0'
+    env_name = 'Pendulum-v0'
     env = gym.make(env_name)
     # obs_size = env.observation_space.spaces['observation'].shape[0]
     # action_size = env.action_space.shape[0]
