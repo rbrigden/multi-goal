@@ -232,14 +232,14 @@ class A2C(object):
         if warmup:
             value_loss.backward()
         else:
-            (0.5 * value_loss + action_loss + 0.01 * entropy_loss).backward()
+            (self.args.value_coef * value_loss + action_loss + self.args.entropy_coef * entropy_loss).backward()
 
-        nn.utils.clip_grad_norm_(self.actor_critic.parameters(), 0.5)
+        if self.args.max_grad_norm:
+            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.args.max_grad_norm)
         self.optimizer.step()
         self.manager.reset()
 
         return value_loss.item(), action_loss.item(), entropy_loss.item()
-
 
     def generate_episode(self, render=False):
         states = []
@@ -280,8 +280,14 @@ def parse_arguments():
                         default=100, help="Number of steps to take in each worker.")
     parser.add_argument('--num-workers', type=int,
                         default=20, help="Number of workers.")
-    parser.add_argument('--lr', dest='lr', type=float,
+    parser.add_argument('--lr',  type=float,
                         default=1e-4, help="The learning rate.")
+    parser.add_argument('--entropy-coef',  type=float,
+                        default=0.01, help="Entropy coefficient.")
+    parser.add_argument('--value-coef', type=float,
+                        default=0.5, help="Value coefficient")
+    parser.add_argument('--max-grad-norm', type=float,
+                        default=0.5, help="Max gradient norm")
     parser.add_argument('--gamma', type=float,
                         default=0.99, help="gamma")
     parser.add_argument('--gae-lambda', type=float,
@@ -290,6 +296,8 @@ def parse_arguments():
                         default=5, help="Checkpoint frequency")
     parser.add_argument('--resume', type=str,
                         default=None, help="Checkpoint file name to resume from")
+    parser.add_argument('--env', type=str,
+                        default="Pendulum-v0", help="environment name")
     parser.add_argument('--render',
                         action='store_true', default=False,
                         help="Whether to render the environment.")
@@ -299,9 +307,8 @@ def parse_arguments():
 
 def train(args):
 
-    writer = SummaryWriter(comment='_a2c_')
 
-    env_name = 'Pendulum-v0'
+    env_name = args.env
     env = gym.make(env_name)
     # obs_size = env.observation_space.spaces['observation'].shape[0]
     # action_size = env.action_space.shape[0]
@@ -311,6 +318,23 @@ def train(args):
 
     model = ActorCritic(obs_size, action_size)
     runner = A2C(env_name, model, args)
+
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+            checkpoint = torch.load(args.resume)
+            model.load_state_dict(checkpoint['state_dict'])
+            runner.optimizer.load_state_dict(checkpoint['optimizer'])
+            print("=> loaded checkpoint '{}'"
+                  .format(args.resume))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+
+    if args.render:
+        runner.eval(5, render=True)
+        exit(0)
+    else:
+        writer = SummaryWriter(comment='_a2c_')
 
     for u in range(1, args.num_updates):
 
@@ -332,16 +356,6 @@ def train(args):
                         'optimizer': runner.optimizer.state_dict(),
                         }, "a2c_checkpoint.pt")
 
-        if args.resume:
-            if os.path.isfile(args.resume):
-                print("=> loading checkpoint '{}'".format(args.resume))
-                checkpoint = torch.load(args.resume)
-                model.load_state_dict(checkpoint['state_dict'])
-                runner.optimizer.load_state_dict(checkpoint['optimizer'])
-                print("=> loaded checkpoint '{}' (epoch {})"
-                      .format(args.resume, checkpoint['epoch']))
-            else:
-                print("=> no checkpoint found at '{}'".format(args.resume))
 
 if __name__ == '__main__':
     # Parse command-line arguments.
