@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.distributions
 import torch.optim as optim
-from torch.distributions import MultivariateNormal
+from torch.distributions import Normal
 from tensorboardX import SummaryWriter
 import os
 
@@ -32,13 +32,17 @@ class Policy(nn.Module):
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
             nn.Linear(64, self.action_space)
         )
+        self.log_std = nn.Parameter(torch.zeros(self.action_space))
+
 
     def forward(self, input_x):
         loc = self.net(input_x)
-        sigma = torch.eye(self.action_space) * self.std
-        return MultivariateNormal(loc=loc, covariance_matrix=sigma.unsqueeze(0))
+        sigma = torch.exp(self.log_std)
+        return Normal(loc=loc, scale=sigma)
 
     def sample(self, inp):
         dist = self.forward(inp)
@@ -58,7 +62,7 @@ class Reinforce(object):
         self.lr = lr
         self.gamma = gamma
         self.optimizer = optim.Adam(self.policy.parameters(), lr=self.lr)
-        self.lr_scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.98)
+        # self.lr_scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.98)
 
     def train(self, env, render=False):
         self.optimizer.zero_grad()
@@ -116,11 +120,11 @@ class Reinforce(object):
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--num-episodes', dest='num_episodes', type=int,
-                        default=50000, help="Number of episodes to train on.")
+                        default=100000, help="Number of episodes to train on.")
     parser.add_argument('--lr', dest='lr', type=float,
-                        default=1e-2, help="The learning rate.")
+                        default=1e-4, help="The learning rate.")
     parser.add_argument('--gamma', dest='gamma', type=float,
-                        default=1, help="gamma")
+                        default=0.99, help="gamma")
     parser.add_argument('--checkpt', dest='checkpt', type=float,
                         default=1000, help="Checkpoint frequency")
     parser.add_argument('--resume', dest='resume', type=str,
@@ -132,14 +136,14 @@ def parse_arguments():
 
     return parser.parse_args()
 
-def train(config):
+def train(args):
     env = gym.make('FetchPushDense-v1')
     model = Policy(env.observation_space.spaces['observation'].shape[0], env.action_space.shape[0])
     model.apply(weight_init)
     writer = SummaryWriter(comment='_reinforce_')
     num_episodes = args.num_episodes
-    lr = config["lr"]
-    gamma = config["gamma"]
+    lr = args.lr
+    gamma = args.gamma
     render = args.render
     trainer = Reinforce(model, args, lr, gamma)
 
@@ -171,22 +175,19 @@ def train(config):
             torch.save({'epoch': epi + 1,
             'state_dict': trainer.policy.state_dict(),
             'optimizer' : trainer.optimizer.state_dict(),
-                        }, "reinf_changed_1e84_post50k.pt")
+                        }, "checkpoint.pt")
 
-            mean_episode_reward = 1e2 * np.mean(rewards_per_episode)
-            std_episode_reward = 1e2 * np.std(rewards_per_episode)
-            mean_episode_loss = 1e2 * np.mean(loss_per_episode)
+            mean_episode_reward = np.mean(rewards_per_episode)
+            std_episode_reward = np.std(rewards_per_episode)
+            mean_episode_loss = np.mean(loss_per_episode)
             avg_steps = np.mean(steps_per_episode)
-            eval_mean_episode_return, eval_max_episode_return, eval_std_episode_return = [1e2 * x for x in
-                                                                                          trainer.eval()]
-            curr_lr = trainer.lr_scheduler.get_lr()[0]
-            print('Episode: {}, Eval return: {}', epi, eval_mean_episode_return)
+            eval_mean_episode_return, eval_max_episode_return, eval_std_episode_return = trainer.eval()
+            print('Episode: {}, Eval return: {}'.format(epi, eval_mean_episode_return))
             writer.add_scalar('data/mean_episode_reward', mean_episode_reward, epi)
             writer.add_scalar('data/std_episode_reward', std_episode_reward, epi)
             writer.add_scalar('data/mean_episode_loss', mean_episode_loss, epi)
             writer.add_scalar('data/eval_mean_episode_return', eval_mean_episode_return, epi)
             writer.add_scalar('data/eval_std_episode_return', eval_std_episode_return, epi)
-            writer.add_scalar('data/curr_lr', curr_lr, epi)
             writer.add_scalar('data/avg_steps', avg_steps, epi)
 
             rewards_per_episode = []
@@ -200,13 +201,4 @@ if __name__ == '__main__':
 
     # Create the environment.
     env = gym.make('FetchPushDense-v1')
-
-    env.seed(123)
-    np.random.seed(123)
-    torch.manual_seed(123)
-
-    config = {
-                 "lr": 1e-3,
-                 "gamma": 1
-             }
-    train(config)
+    train(args)
