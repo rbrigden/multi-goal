@@ -84,8 +84,6 @@ class Critic(nn.Module):
         return self.net(input_x)
 
 
-
-
 def init(module, weight_init, bias_init, gain=1):
     weight_init(module.weight.data, gain=gain)
     bias_init(module.bias.data)
@@ -135,8 +133,8 @@ class EnvManager:
 
     def __init__(self, env_name, num_envs, num_steps, as_storage=False):
 
-        if not as_storage:
-            self.envs = [gym.make(env_name) for _ in range(num_envs)]
+        self.envs = [gym.make(env_name) for _ in range(num_envs)]
+
 
         # obs_size = self.envs[0].observation_space.spaces['observation'].shape[0]
         # action_size = self.envs[0].action_space.shape[0]
@@ -194,11 +192,14 @@ class EnvManager:
 
         self.t += 1
 
-    def compute_returns(self, actor_critic, gamma):
+    def compute_returns(self, actor_critic, gamma, goals):
         returns = torch.zeros(self.num_steps+1, self.num_envs, 1)
 
         with torch.no_grad():
-            next_value = actor_critic.value(self.state_n[-1])
+            # Different goal for each rollout
+            expanded_goals = goals.unsqueeze(1)
+            states_with_goals = torch.cat([self.state_n[-1], expanded_goals], dim=1)
+            next_value = actor_critic.value(states_with_goals)
             returns[-1] = next_value
             for step in reversed(range(self.reward_n.size(0))):
                 returns[step] = (returns[step + 1] * gamma * (1 - self.terminal_n[step + 1]) + self.reward_n[step])
@@ -232,14 +233,9 @@ class A2C(object):
 
         # active goal managers
         # self.active_managers = [EnvManager(env_name, args.num_workers, args.num_steps) for _ in range(self.args.num_active_goals)]
+        self.ag_manager = EnvManager(self.env_name, self.args.num_active_goals, self.args.num_steps)
 
         self.num_steps = args.num_steps
-
-
-    def create_active_goal_rollout(self, active_goals):
-
-
-        pass
 
     def rollout(self):
 
@@ -251,23 +247,21 @@ class A2C(object):
         feasible_active_goals = self.og_manager.state_n.clone()
         num_active_goals_per_worker = self.args.num_active_goals // self.args.num_workers
 
-        # One rollout manager
-        ag_manager = EnvManager(self.env_name, self.args.num_active_goals, self.args.num_steps)
-
-
+        active_goal_idxs = []
+        active_goals = []
         for i in range(self.args.num_workers):
-            goal_idxs = torch.randint(0, self.num_steps, size=(num_active_goals_per_worker,))
-            active_goals = torch.index_select(feasible_active_goals, 0, goal_idxs)[:, i, 0]
+            worker_goal_idxs = torch.ones((num_active_goals_per_worker,)).long() * (self.num_steps - 1)
+            worker_active_goals = torch.index_select(feasible_active_goals, 0, worker_goal_idxs)[:, i, 0]
 
             # Copy the original trajectory and update returns according to active goals
-            for j in range(goal_idxs.size(0)):
+            for j in range(worker_goal_idxs.size(0)):
                 original_rollout_idx = i
                 new_rollout_idx = num_active_goals_per_worker * i + j
 
                 original_states = self.og_manager.state_n[:, original_rollout_idx].clone()
                 original_actions = self.og_manager.action_n[:, original_rollout_idx].clone()
                 original_env = self.og_manager.envs[original_rollout_idx]
-                selected_goal = active_goals[j]
+                selected_goal = worker_active_goals[j]
 
                 # rewards under the new goal
                 new_rewards = [original_env.reward_query(original_actions[t], original_states[t], selected_goal) for t in range(self.args.num_steps)]
@@ -277,32 +271,74 @@ class A2C(object):
                 with torch.no_grad():
                     new_value_preds = self.actor_critic.value(append_goal_to_state(original_states, selected_goal))
 
-                ag_manager.state_n[:, new_rollout_idx].copy_(original_states)
-                ag_manager.action_n[:, new_rollout_idx].copy_(original_actions)
-                ag_manager.reward_n[:, new_rollout_idx].copy_(new_rewards)
-                ag_manager.terminal_n[:, new_rollout_idx].copy_(self.og_manager.terminal_n[:, original_rollout_idx])
-                ag_manager.value_pred_n[:, new_rollout_idx].copy_(new_value_preds)
+                self.ag_manager.state_n[:, new_rollout_idx].copy_(original_states)
+                self.ag_manager.action_n[:, new_rollout_idx].copy_(original_actions)
+                self.ag_manager.reward_n[:, new_rollout_idx].copy_(new_rewards)
+                self.ag_manager.terminal_n[:, new_rollout_idx].copy_(self.og_manager.terminal_n[:, original_rollout_idx])
+                self.ag_manager.terminal_n[-1, new_rollout_idx] = 1.0
+                self.ag_manager.value_pred_n[:, new_rollout_idx].copy_(new_value_preds)
 
+            active_goal_idxs.append(worker_goal_idxs)
+            active_goals.append(worker_active_goals)
+        return torch.cat(active_goal_idxs), torch.cat(active_goals)
+
+    def compute_active_goal_loss(self, active_goals, og_action_log_probs):
+
+        # A tensor of goals that correspond to the rollouts considered under these goals
+        expanded_ags = active_goals.unsqueeze(1).unsqueeze(0).repeat(self.args.num_steps+1, 1, 1)
+
+        # Append the appropriate goal to every state
+        states_with_active_goals = torch.cat([self.ag_manager.state_n, expanded_ags], dim=2)
+
+        ag_flat_action_dists, ag_flat_value_preds = self.actor_critic.forward(states_with_active_goals[:-1].view((-1, self.ag_manager.obs_size + 1)))
+
+        ag_action_log_probs = ag_flat_action_dists.log_prob(self.ag_manager.action_n.view((-1, self.ag_manager.action_size))).view(self.args.num_steps, self.args.num_active_goals, 1)
+
+        # We need to consider the log prob of actions under their original trajectory
+        num_active_goals_per_worker = self.args.num_active_goals // self.args.num_workers
+        og_action_log_probs = og_action_log_probs.view(self.args.num_steps, self.args.num_workers, 1)
+        og_action_log_probs = og_action_log_probs.repeat(1, 1, num_active_goals_per_worker).view(self.args.num_steps, self.args.num_active_goals, 1)
+
+        ag_returns = self.ag_manager.compute_returns(self.actor_critic, self.args.gamma, active_goals)
+        ag_advantages = ag_returns[:-1] - ag_flat_value_preds.view(self.args.num_steps, self.args.num_active_goals, 1)
+        ag_value_loss = ag_advantages.pow(2).mean()
+
+        log_action_ratios = ag_action_log_probs - og_action_log_probs
+        action_weights = torch.exp(torch.cumsum(log_action_ratios, dim=0))
+
+        ag_policy_loss = - torch.mean(ag_advantages.detach() * action_weights * ag_action_log_probs)
+
+        return ag_policy_loss, ag_value_loss
 
 
     def forward(self):
+        active_goal_idxs, active_goals = self.rollout()
 
-        self.rollout()
+        og_goals = torch.ones(self.args.num_workers) * self.original_goal
+        og_returns = self.og_manager.compute_returns(self.actor_critic, self.args.gamma, og_goals)
+
+        expanded_ogs = og_goals.unsqueeze(1).unsqueeze(0).repeat(self.args.num_steps + 1, 1, 1)
+        states_with_og_goal = torch.cat([self.og_manager.state_n, expanded_ogs], dim=2)
+
+        og_flat_action_dists, og_flat_value_preds = self.actor_critic.forward(states_with_og_goal[:-1].view((-1, self.og_manager.obs_size+1)))
 
 
-        returns = self.manager.compute_returns(self.actor_critic, self.args.gamma)
-        action_out, value_out = self.actor_critic.forward(self.og_manager.state_n[:-1].view((-1, self.manager.obs_size)))
+        og_action_log_probs = og_flat_action_dists.log_prob(self.og_manager.action_n.view((-1, self.og_manager.action_size))).view(self.args.num_steps, self.args.num_workers, 1)
+        ag_policy_loss, ag_value_loss = self.compute_active_goal_loss(active_goals, og_action_log_probs.detach())
 
-        advantages = returns[:-1] - value_out.view(self.args.num_steps, self.args.num_workers, 1)
+        og_advantages = og_returns[:-1] - og_flat_value_preds.view(self.args.num_steps, self.args.num_workers, 1)
+        og_value_loss = og_advantages.pow(2).mean()
 
-        value_loss = advantages.pow(2).mean()
+        policy_entropy = og_flat_action_dists.entropy().mean()
 
-        policy_entropy = action_out.entropy().mean()
+        og_policy_loss = - torch.mean(og_advantages.detach() * og_action_log_probs)
 
-        action_log_probs = action_out.log_prob(self.manager.action_n.view((-1, self.manager.action_size))).view(self.args.num_steps, self.args.num_workers, 1)
-        action_loss = - torch.mean(advantages.detach() * action_log_probs)
+        alpha = self.args.num_workers / (self.args.num_workers + self.args.num_active_goals)
 
-        return value_loss, action_loss, -policy_entropy
+        policy_loss = alpha * og_policy_loss + (1 - alpha) * ag_policy_loss
+        value_loss = alpha * og_value_loss + (1 - alpha) * ag_value_loss
+
+        return value_loss, policy_loss, -policy_entropy
 
     def train_step(self, warmup=False):
 
@@ -317,7 +353,7 @@ class A2C(object):
         if self.args.max_grad_norm:
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.args.max_grad_norm)
         self.optimizer.step()
-        self.manager.reset()
+        self.og_manager.reset()
 
         return value_loss.item(), action_loss.item(), entropy_loss.item()
 
@@ -333,7 +369,7 @@ class A2C(object):
                 self.eval_env.render()
                 time.sleep(0.01)
             with torch.no_grad():
-                action = self.actor_critic.act(state.view((1, -1))).numpy().reshape((-1,))
+                action = self.actor_critic.act(append_goal_to_state(state.view((1, -1)), self.original_goal)).numpy().reshape((-1,))
             next_state, reward, terminal, info = self.eval_env.step(action)
             next_state = proc_state(next_state)
             states.append(state)

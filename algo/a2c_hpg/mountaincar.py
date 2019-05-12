@@ -42,15 +42,20 @@ class ContinuousMountainCarVarGoal(Continuous_MountainCarEnv):
     def reward_query(self, action, state, goal):
         reward = 0
         position = state[0]
+        velocity = state[1]
+
         reward -= math.pow(action[0], 2)*0.1
-        if bool(abs(position) >= abs(goal)):
-            reward += self.goal_reward
+        if goal < 0:
+            if position < goal and velocity < 0:
+                reward += self.goal_reward
+        else:
+            if position > goal and velocity > 0:
+                reward += self.goal_reward
         return reward
 
 
 
 
-print("here")
 register(
     id='MountainCarContinuous-v5',
     entry_point='algo.a2c_hpg.mountaincar:ContinuousMountainCarVarGoal',
