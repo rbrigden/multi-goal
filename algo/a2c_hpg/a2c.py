@@ -278,9 +278,6 @@ class A2C(object):
                     # Goal is the position (state index 0)
                     worker_active_goal = feasible_active_goals[worker_goal_idx, original_rollout_idx, 0]
 
-                    if worker_active_goal < 0.1:
-                        continue
-
                     # rewards under the new goal
 
                     original_env = self.og_manager.envs[original_rollout_idx]
@@ -318,15 +315,6 @@ class A2C(object):
                     original_trajectory_map.append(original_rollout_idx)
                     valid_trajectory_idxs.append(new_rollout_idx)
                     break
-
-        # Do some cleanup
-        # self.ag_manager.state_n = torch.index_select(self.ag_manager.state_n, 1, torch.tensor(valid_trajectory_idxs))
-        # self.ag_manager.action_n = torch.index_select(self.ag_manager.action_n, 1, torch.tensor(valid_trajectory_idxs))
-        # self.ag_manager.reward_n = torch.index_select(self.ag_manager.reward_n, 1, torch.tensor(valid_trajectory_idxs))
-        # self.ag_manager.terminal_n = torch.index_select(self.ag_manager.terminal_n, 1, torch.tensor(valid_trajectory_idxs))
-        # self.ag_manager.value_pred_n = torch.index_select(self.ag_manager.value_pred_n, 1, torch.tensor(valid_trajectory_idxs))
-        # self.ag_manager.num_envs = len(valid_trajectory_idxs)
-
 
         return torch.tensor(active_goal_idxs).long(), \
                torch.tensor(active_goals).float(), \
@@ -446,7 +434,7 @@ class A2C(object):
             rewards.append(reward)
             state = next_state
 
-        self.eval_env.close()
+        # self.eval_env.close()
 
         return torch.tensor(rewards).unsqueeze(1)
 
