@@ -47,7 +47,7 @@ class ContinuousMountainCarVarGoal(Continuous_MountainCarEnv):
         done = bool(position >= goal)
         reward = 0
         if done:
-            reward = 100.0
+            reward = 10.0
         reward -= math.pow(action[0], 2)*0.1
 
         return reward, done

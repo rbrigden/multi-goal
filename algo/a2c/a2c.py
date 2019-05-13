@@ -13,6 +13,7 @@ from tensorboardX import SummaryWriter
 import os
 import torch.nn.functional as F
 import time
+import algo.a2c.seek
 
 def weight_init(m):
     if isinstance(m, nn.Linear):
@@ -59,9 +60,12 @@ class ActorCritic(nn.Module):
     def value(self, x):
         return self.critic(self.base_net2(x))
 
-    def act(self, x):
+    def act(self, x, deterministic=False):
         with torch.no_grad():
-            action = self.policy(self.base_net1(x)).sample()
+            if deterministic:
+                action = self.policy(self.base_net1(x)).mean
+            else:
+                action = self.policy(self.base_net1(x)).sample()
         return action
 
 
@@ -127,6 +131,7 @@ class EnvManager:
 
     def __init__(self, env_name, num_envs, num_steps):
         self.envs = [gym.make(env_name) for _ in range(num_envs)]
+
 
         # obs_size = self.envs[0].observation_space.spaces['observation'].shape[0]
         # action_size = self.envs[0].action_space.shape[0]
@@ -219,7 +224,7 @@ class A2C(object):
 
         policy_entropy = action_out.entropy().mean()
 
-        action_log_probs = action_out.log_prob(self.manager.action_n.view((-1, self.manager.action_size))).view(self.args.num_steps, self.args.num_workers, 1)
+        action_log_probs = action_out.log_prob(self.manager.action_n.view((-1, self.manager.action_size))).view(self.args.num_steps, self.args.num_workers, self.manager.action_size)
         action_loss = - torch.mean(advantages.detach() * action_log_probs)
 
         return value_loss, action_loss, -policy_entropy
@@ -251,9 +256,9 @@ class A2C(object):
         while not terminal:
             if render:
                 self.eval_env.render()
-                time.sleep(0.01)
+                time.sleep(0.1)
             with torch.no_grad():
-                action = self.actor_critic.act(state.view((1, -1))).numpy().reshape((-1,))
+                action = self.actor_critic.act(state.view((1, -1)), deterministic=render).numpy().reshape((-1,))
             next_state, reward, terminal, info = self.eval_env.step(action)
             next_state = proc_state(next_state)
             states.append(state)
@@ -261,7 +266,7 @@ class A2C(object):
             rewards.append(reward)
             state = next_state
 
-        self.eval_env.close()
+        # self.eval_env.close()
 
         return torch.tensor(rewards).unsqueeze(1)
 

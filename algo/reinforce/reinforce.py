@@ -50,8 +50,9 @@ class Policy(nn.Module):
         return sample
 
 def proc_state(x):
-    return x["observation"]
-
+    # x = x["observation"]
+    # return torch.FloatTensor(x)
+    return x
 
 class Reinforce(object):
     # Implementation of the policy gradient method REINFORCE.
@@ -119,26 +120,31 @@ class Reinforce(object):
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--num-episodes', dest='num_episodes', type=int,
-                        default=100000, help="Number of episodes to train on.")
-    parser.add_argument('--lr', dest='lr', type=float,
+    parser.add_argument('--num-episodes', type=int,
+                        default=10000, help="Number of episodes to train on.")
+    parser.add_argument('--lr',  type=float,
                         default=1e-4, help="The learning rate.")
-    parser.add_argument('--gamma', dest='gamma', type=float,
+    parser.add_argument('--max-grad-norm', type=float,
+                        default=0.5, help="Max gradient norm")
+    parser.add_argument('--gamma', type=float,
                         default=0.99, help="gamma")
-    parser.add_argument('--checkpt', dest='checkpt', type=float,
-                        default=1000, help="Checkpoint frequency")
-    parser.add_argument('--resume', dest='resume', type=str,
-                        default='', help="Checkpoint file name to resume from")
-    parser.add_argument('--render', dest='render',
-                         action='store_true', default=False,
-                         help="Whether to render the environment.")
-    parser.set_defaults(render=False)
+    parser.add_argument('--checkpt', type=float,
+                        default=5, help="Checkpoint frequency")
+    parser.add_argument('--resume', type=str,
+                        default=None, help="Checkpoint file name to resume from")
+    parser.add_argument('--env', type=str,
+                        default="Pendulum-v0", help="environment name")
+    parser.add_argument('--render',
+                        action='store_true', default=False,
+                        help="Whether to render the environment.")
 
     return parser.parse_args()
 
+
+
 def train(args):
-    env = gym.make('FetchPushDense-v1')
-    model = Policy(env.observation_space.spaces['observation'].shape[0], env.action_space.shape[0])
+    env = gym.make(args.env)
+    model = Policy(env.observation_space.shape[0], env.action_space.shape[0])
     model.apply(weight_init)
     writer = SummaryWriter(comment='_reinforce_')
     num_episodes = args.num_episodes
@@ -148,7 +154,7 @@ def train(args):
     trainer = Reinforce(model, args, lr, gamma)
 
     start_epoch = 0
-    if args.resume != '':
+    if args.resume is not None:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
             checkpoint = torch.load(args.resume)
@@ -200,5 +206,5 @@ if __name__ == '__main__':
     num_episodes = args.num_episodes
 
     # Create the environment.
-    env = gym.make('FetchPushDense-v1')
+    env = gym.make(args.env)
     train(args)
