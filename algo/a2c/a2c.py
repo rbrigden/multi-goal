@@ -256,7 +256,7 @@ class A2C(object):
         while not terminal:
             if render:
                 self.eval_env.render()
-                time.sleep(0.1)
+                time.sleep(0.2)
             with torch.no_grad():
                 action = self.actor_critic.act(state.view((1, -1)), deterministic=render).numpy().reshape((-1,))
             next_state, reward, terminal, info = self.eval_env.step(action)
