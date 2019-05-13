@@ -39,19 +39,18 @@ class ContinuousMountainCarVarGoal(Continuous_MountainCarEnv):
         self.state = np.array([position, velocity])
         return self.state, reward, done, {}
 
-    def reward_query(self, action, state, goal):
+    def goal_query(self, action, state, goal):
         reward = 0
         position = state[0]
         velocity = state[1]
 
+        done = bool(position >= goal)
+        reward = 0
+        if done:
+            reward = 100.0
         reward -= math.pow(action[0], 2)*0.1
-        if goal < 0:
-            if position < goal and velocity < 0:
-                reward += self.goal_reward
-        else:
-            if position > goal and velocity > 0:
-                reward += self.goal_reward
-        return reward
+
+        return reward, done
 
 
 

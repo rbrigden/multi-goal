@@ -247,40 +247,76 @@ class A2C(object):
         feasible_active_goals = self.og_manager.state_n.clone()
         num_active_goals_per_worker = self.args.num_active_goals // self.args.num_workers
 
+
+        # Valid new trajectories
+        original_trajectory_map = []
+        valid_trajectory_idxs = []
+
         active_goal_idxs = []
         active_goals = []
         for i in range(self.args.num_workers):
-            worker_goal_idxs = torch.ones((num_active_goals_per_worker,)).long() * (self.num_steps - 1)
-            worker_active_goals = torch.index_select(feasible_active_goals, 0, worker_goal_idxs)[:, i, 0]
 
-            # Copy the original trajectory and update returns according to active goals
-            for j in range(worker_goal_idxs.size(0)):
-                original_rollout_idx = i
-                new_rollout_idx = num_active_goals_per_worker * i + j
+            for j in range(num_active_goals_per_worker):
 
-                original_states = self.og_manager.state_n[:, original_rollout_idx].clone()
-                original_actions = self.og_manager.action_n[:, original_rollout_idx].clone()
-                original_env = self.og_manager.envs[original_rollout_idx]
-                selected_goal = worker_active_goals[j]
+                for k in np.random.permutation(self.num_steps):
 
-                # rewards under the new goal
-                new_rewards = [original_env.reward_query(original_actions[t], original_states[t], selected_goal) for t in range(self.args.num_steps)]
-                new_rewards = torch.tensor(new_rewards).float().view(-1, 1)
+                    original_rollout_idx = i
+                    new_rollout_idx = num_active_goals_per_worker * i + j
 
-                # update the state value predictions under the new goal
-                with torch.no_grad():
-                    new_value_preds = self.actor_critic.value(append_goal_to_state(original_states, selected_goal))
+                    # Sample a new active goal
+                    worker_goal_idx = np.random.randint(0, self.num_steps)
 
-                self.ag_manager.state_n[:, new_rollout_idx].copy_(original_states)
-                self.ag_manager.action_n[:, new_rollout_idx].copy_(original_actions)
-                self.ag_manager.reward_n[:, new_rollout_idx].copy_(new_rewards)
-                self.ag_manager.terminal_n[:, new_rollout_idx].copy_(self.og_manager.terminal_n[:, original_rollout_idx])
-                self.ag_manager.terminal_n[-1, new_rollout_idx] = 1.0
-                self.ag_manager.value_pred_n[:, new_rollout_idx].copy_(new_value_preds)
+                    # Goal is the position (state index 0)
+                    worker_active_goal = feasible_active_goals[worker_goal_idx, original_rollout_idx, 0]
 
-            active_goal_idxs.append(worker_goal_idxs)
-            active_goals.append(worker_active_goals)
-        return torch.cat(active_goal_idxs), torch.cat(active_goals)
+                    # rewards under the new goal
+
+                    original_env = self.og_manager.envs[original_rollout_idx]
+                    new_rewards_and_terminals = [original_env.goal_query(self.og_manager.action_n[t, original_rollout_idx],
+                                                                         self.og_manager.state_n[t, original_rollout_idx],
+                                                                         worker_active_goal) for t in range(self.args.num_steps)]
+
+                    new_rewards, new_terminals = zip(*new_rewards_and_terminals)
+
+                    # check if we have a long enough trajectory
+                    if new_terminals.index(True) <= self.args.min_trajectory_length:
+                        continue
+
+                    new_rewards = torch.tensor(new_rewards).float().view(-1, 1)
+                    new_terminals = torch.tensor([0.0] + list(new_terminals)).float().view(-1, 1)
+
+
+                    original_states = self.og_manager.state_n[:, original_rollout_idx].clone()
+                    original_actions = self.og_manager.action_n[:, original_rollout_idx].clone()
+
+                    # update the state value predictions under the new goal
+                    with torch.no_grad():
+                        new_value_preds = self.actor_critic.value(append_goal_to_state(original_states, worker_active_goal))
+
+
+                    self.ag_manager.state_n[:, new_rollout_idx].copy_(original_states)
+                    self.ag_manager.action_n[:, new_rollout_idx].copy_(original_actions)
+                    self.ag_manager.reward_n[:, new_rollout_idx].copy_(new_rewards)
+                    self.ag_manager.terminal_n[:, new_rollout_idx].copy_(new_terminals)
+                    self.ag_manager.value_pred_n[:, new_rollout_idx].copy_(new_value_preds)
+                    active_goal_idxs.append(worker_goal_idx)
+                    active_goals.append(worker_active_goal)
+                    original_trajectory_map.append(original_rollout_idx)
+                    valid_trajectory_idxs.append(new_rollout_idx)
+                    break
+
+        # Do some cleanup
+        self.ag_manager.state_n = torch.index_select(self.ag_manager.state_n, 1, torch.tensor(valid_trajectory_idxs))
+        self.ag_manager.action_n = torch.index_select(self.ag_manager.action_n, 1, torch.tensor(valid_trajectory_idxs))
+        self.ag_manager.reward_n = torch.index_select(self.ag_manager.reward_n, 1, torch.tensor(valid_trajectory_idxs))
+        self.ag_manager.terminal_n = torch.index_select(self.ag_manager.terminal_n, 1, torch.tensor(valid_trajectory_idxs))
+        self.ag_manager.value_pred_n = torch.index_select(self.ag_manager.value_pred_n, 1, torch.tensor(valid_trajectory_idxs))
+        self.ag_manager.num_envs = len(valid_trajectory_idxs)
+
+
+        return torch.tensor(active_goal_idxs).long(), \
+               torch.tensor(active_goals).float(), \
+               original_trajectory_map
 
     def compute_active_goal_loss(self, active_goals, og_action_log_probs):
 
@@ -392,6 +428,8 @@ def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--num-updates', type=int,
                         default=1000, help="Number of episodes to train on.")
+    parser.add_argument('--min-trajectory-length', type=int,
+                        default=5, help="Number of episodes to train on.")
     parser.add_argument('--num-active-goals', type=int,
                         default=5, help="Number of episodes to train on.")
     parser.add_argument('--num-steps', type=int,
