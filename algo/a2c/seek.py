@@ -1,6 +1,6 @@
 from gym import register
 import gym
-
+import numpy as np
 
 register(
     id='SeekDense-v0',
@@ -27,7 +27,8 @@ class SeekEnvDense(gym.Env):
             world.sparse_reward = False
 
             # create multiagent environment
-            self._env = MultiAgentEnv(world, scenario.reset_world, scenario.reward, scenario.observation)
+            self._env = MultiAgentEnv(world, scenario.reset_world, scenario.reward, scenario.observation,
+                                      None, None)
 
     def step(self, action):
         obs_n, reward_n, done_n, info_n = self._env.step([action])
@@ -35,6 +36,8 @@ class SeekEnvDense(gym.Env):
 
     def reset(self):
         return self._env.reset()[0]
+
+
 
     def render(self, mode='human'):
         self._env.render()
@@ -61,7 +64,8 @@ class SeekEnvSparse(gym.Env):
         world.sparse_reward = True
 
         # create multiagent environment
-        self._env = MultiAgentEnv(world, scenario.reset_world, scenario.reward, scenario.observation)
+        self._env = MultiAgentEnv(world, scenario.reset_world, scenario.reward, scenario.observation,
+                                  None, scenario.done)
 
     def step(self, action):
         obs_n, reward_n, done_n, info_n = self._env.step([action])
@@ -80,3 +84,19 @@ class SeekEnvSparse(gym.Env):
     @property
     def action_space(self):
         return self._env.action_space[0]
+
+    def goal_from_state(self, state):
+        return state[-2:]
+
+
+    def goal_query(self, action, state, goal):
+        position = state.numpy()[-2:]
+        goal = goal.numpy()
+        action = action.numpy()
+
+        eps = 0.05
+        dist1 = np.sqrt(np.sum(np.square(position - goal)))
+        reward = 5.0 if dist1 < eps else -0.01
+        done = True if dist1 < eps else False
+        return reward, done
+

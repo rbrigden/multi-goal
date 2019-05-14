@@ -14,6 +14,7 @@ import os
 import torch.nn.functional as F
 import time
 import algo.a2c_hpg.mountaincar
+import algo.a2c.seek
 
 def weight_init(m):
     if isinstance(m, nn.Linear):
@@ -23,12 +24,12 @@ def weight_init(m):
 
 class ActorCritic(nn.Module):
 
-    def __init__(self, observation_space, action_space, goal_space, hidden_size=64):
+    def __init__(self, observation_space, action_space, hidden_size=64):
         super(ActorCritic, self).__init__()
         self.hidden_size = 64
         self.action_space = action_space
         # Add one for the goal
-        self.observation_space = observation_space + goal_space
+        self.observation_space = observation_space
         self.critic = Critic(self.hidden_size)
         self.policy = Policy(self.hidden_size, action_space)
 
@@ -167,7 +168,8 @@ class EnvManager:
         self.terminal_n[0].copy_(self.terminal_n[-1])
         self.t = 0
 
-    def step(self, actor_critic, goal):
+    def step(self, actor_critic):
+
         if self.as_storage:
             raise ValueError("This manager is being used as storage. Can't step.")
 
@@ -177,11 +179,13 @@ class EnvManager:
 
         state_batch = self.state_n[self.t]
 
+        step_goals = [env.goal_from_state(state_batch[i].numpy()) for i, env in enumerate(self.envs)]
+
         with torch.no_grad():
-            action_batch = actor_critic.act(append_goal_to_state(state_batch, goal))
+            action_batch = actor_critic.act(state_batch)
             self.action_n[self.t] = action_batch
 
-            value_batch = actor_critic.value(append_goal_to_state(state_batch, goal))
+            value_batch = actor_critic.value(state_batch)
             self.value_pred_n[self.t] = value_batch
 
         for idx, env in enumerate(self.envs):
@@ -192,13 +196,14 @@ class EnvManager:
 
         self.t += 1
 
-    def compute_returns(self, actor_critic, gamma, goals):
+        return step_goals
+
+    def compute_returns(self, actor_critic, gamma):
         returns = torch.zeros(self.num_steps+1, self.num_envs, 1)
 
         with torch.no_grad():
             # Different goal for each rollout
-            expanded_goals = goals.unsqueeze(1)
-            states_with_goals = torch.cat([self.state_n[-1], expanded_goals], dim=1)
+            states_with_goals = self.state_n[-1]
             next_value = actor_critic.value(states_with_goals)
             returns[-1] = next_value
             for step in reversed(range(self.reward_n.size(0))):
@@ -235,9 +240,6 @@ class A2C(object):
         self.optimizer = optim.RMSprop(self.actor_critic.parameters(), lr=self.args.lr, alpha=0.99, eps=1e-5)
         self.eval_env = gym.make(env_name)
 
-        # TODO: This is currently hardcoded for mountaincar will need to update
-        self.original_goal = torch.tensor([0.45])
-
         # original goal manager
         self.og_manager = EnvManager(env_name, args.num_workers, args.num_steps)
 
@@ -250,7 +252,7 @@ class A2C(object):
 
         # Generate rollouts under the original goal
         for t in range(self.num_steps):
-            self.og_manager.step(self.actor_critic, self.original_goal)
+            og_goals = self.og_manager.step(self.actor_critic)
 
         # Collect all feasible active goals
         feasible_active_goals = self.og_manager.state_n.clone()
@@ -272,11 +274,12 @@ class A2C(object):
                     original_rollout_idx = i
                     new_rollout_idx = num_active_goals_per_worker * i + j
 
-                    # Sample a new active goal
-                    worker_goal_idx = np.random.randint(0, self.num_steps)
+                    original_terminals = list(self.og_manager.terminal_n[:, original_rollout_idx].view(-1).numpy().astype(bool))
 
-                    # Goal is the position (state index 0)
-                    worker_active_goal = feasible_active_goals[worker_goal_idx, original_rollout_idx, 0]
+
+                    worker_goal_idx = k
+
+                    worker_active_goal = feasible_active_goals[worker_goal_idx, original_rollout_idx, -2:]
 
                     # rewards under the new goal
 
@@ -287,11 +290,16 @@ class A2C(object):
 
                     new_rewards, new_terminals = zip(*new_rewards_and_terminals)
 
+
+
                     # check if we have a long enough trajectory
                     if new_terminals.index(True) <= self.args.min_trajectory_length:
                         continue
 
-                    print("OG rollout {}, AG rollout {}, Attempts{}, Length {}".format(i, j, k, new_terminals.index(True)))
+                    if True in original_terminals and new_terminals.index(True) > original_terminals.index(True):
+                        continue
+
+                    # print("OG rollout {}, AG rollout {}, Attempts {}, Length {}".format(i, j, k, new_terminals.index(True)))
 
                     new_rewards = torch.tensor(new_rewards).float().view(-1, 1)
                     new_terminals = torch.tensor([0.0] + list(new_terminals)).float().view(-1, 1)
@@ -300,10 +308,11 @@ class A2C(object):
                     original_states = self.og_manager.state_n[:, original_rollout_idx].clone()
                     original_actions = self.og_manager.action_n[:, original_rollout_idx].clone()
 
+                    original_states[:, -2:] = worker_active_goal.unsqueeze(0)
+
                     # update the state value predictions under the new goal
                     with torch.no_grad():
-                        new_value_preds = self.actor_critic.value(append_goal_to_state(original_states, worker_active_goal))
-
+                        new_value_preds = self.actor_critic.value(original_states)
 
                     self.ag_manager.state_n[:, new_rollout_idx].copy_(original_states)
                     self.ag_manager.action_n[:, new_rollout_idx].copy_(original_actions)
@@ -317,7 +326,7 @@ class A2C(object):
                     break
 
         return torch.tensor(active_goal_idxs).long(), \
-               torch.tensor(active_goals).float(), \
+               torch.stack(active_goals).float() if len(active_goals) > 0 else torch.tensor([]), \
                original_trajectory_map, \
                valid_trajectory_idxs
 
@@ -325,7 +334,7 @@ class A2C(object):
 
         # A tensor of goals that correspond to the rollouts considered under these goals
         # expanded_ags = active_goals.unsqueeze(1).unsqueeze(0).repeat(self.args.num_steps+1, 1, 1)
-        og_action_log_probs = og_action_log_probs.view(self.args.num_steps, self.args.num_workers, 1)
+        og_action_log_probs = og_action_log_probs.view(self.args.num_steps, self.args.num_workers, self.ag_manager.action_size)
 
         ag_value_losses, ag_policy_losses = [], []
         for j in range(active_goals.size(0)):
@@ -333,10 +342,9 @@ class A2C(object):
 
             active_goal = active_goals[j]
 
-            # Append the appropriate goal to every state
-            states_with_active_goals = torch.cat([self.ag_manager.state_n[:, i], active_goal.repeat(self.num_steps+1).view(-1, 1)], dim=1)
+            states_with_active_goals = self.ag_manager.state_n[:, i]
 
-            ag_flat_action_dists, ag_flat_value_preds = self.actor_critic.forward(states_with_active_goals[:-1].view((-1, self.ag_manager.obs_size + 1)))
+            ag_flat_action_dists, ag_flat_value_preds = self.actor_critic.forward(states_with_active_goals[:-1].view((-1, self.ag_manager.obs_size)))
 
             ag_action_log_probs = ag_flat_action_dists.log_prob(self.ag_manager.action_n[:, i].view((-1, self.ag_manager.action_size)))
 
@@ -352,12 +360,12 @@ class A2C(object):
             mask = (1 - (torch.cumsum(mask, dim=0) > 0)).float()
 
             ag_advantages = (ag_returns[:-1] - ag_flat_value_preds) * mask[:-1]
-            ag_value_loss = ag_advantages.pow(2).mean()
+            ag_value_loss = ag_advantages.pow(2).sum() / mask[:-1].sum()
 
             log_action_ratios = ag_action_log_probs - traj_og_action_log_probs
             action_weights = torch.exp(torch.cumsum(log_action_ratios, dim=0))
 
-            ag_policy_loss = - torch.mean(mask[:-1] * (ag_advantages.detach() * action_weights * ag_action_log_probs))
+            ag_policy_loss = - torch.sum(mask[:-1] * (ag_advantages.detach() * action_weights.detach() * ag_action_log_probs)) / mask[:-1].sum()
 
             ag_policy_losses.append(ag_policy_loss)
             ag_value_losses.append(ag_value_loss)
@@ -371,16 +379,14 @@ class A2C(object):
     def forward(self):
         active_goal_idxs, active_goals, original_trajectory_map, valid_trajectory_idxs = self.rollout()
 
-        og_goals = torch.ones(self.args.num_workers) * self.original_goal
-        og_returns = self.og_manager.compute_returns(self.actor_critic, self.args.gamma, og_goals)
+        og_returns = self.og_manager.compute_returns(self.actor_critic, self.args.gamma)
 
-        expanded_ogs = og_goals.unsqueeze(1).unsqueeze(0).repeat(self.args.num_steps + 1, 1, 1)
-        states_with_og_goal = torch.cat([self.og_manager.state_n, expanded_ogs], dim=2)
+        states_with_og_goal = self.og_manager.state_n
 
-        og_flat_action_dists, og_flat_value_preds = self.actor_critic.forward(states_with_og_goal[:-1].view((-1, self.og_manager.obs_size+1)))
+        og_flat_action_dists, og_flat_value_preds = self.actor_critic.forward(states_with_og_goal[:-1].view((-1, self.og_manager.obs_size)))
 
 
-        og_action_log_probs = og_flat_action_dists.log_prob(self.og_manager.action_n.view((-1, self.og_manager.action_size))).view(self.args.num_steps, self.args.num_workers, 1)
+        og_action_log_probs = og_flat_action_dists.log_prob(self.og_manager.action_n.view((-1, self.og_manager.action_size))).view(self.args.num_steps, self.args.num_workers, self.og_manager.action_size)
         ag_policy_loss, ag_value_loss = self.compute_active_goal_loss(active_goals, original_trajectory_map, valid_trajectory_idxs, og_action_log_probs.detach())
 
         og_advantages = og_returns[:-1] - og_flat_value_preds.view(self.args.num_steps, self.args.num_workers, 1)
@@ -390,7 +396,8 @@ class A2C(object):
 
         og_policy_loss = - torch.mean(og_advantages.detach() * og_action_log_probs)
 
-        alpha = self.args.num_workers / (self.args.num_workers + len(active_goal_idxs))
+        alpha = float(self.args.num_workers) / (self.args.num_workers + len(active_goal_idxs))
+        # alpha = 1.0
 
         policy_loss = alpha * og_policy_loss + (1 - alpha) * ag_policy_loss
         value_loss = alpha * og_value_loss + (1 - alpha) * ag_value_loss
@@ -426,7 +433,7 @@ class A2C(object):
                 self.eval_env.render()
                 time.sleep(0.01)
             with torch.no_grad():
-                action = self.actor_critic.act(append_goal_to_state(state.view((1, -1)), self.original_goal)).numpy().reshape((-1,))
+                action = self.actor_critic.act(state.view((1, -1))).numpy().reshape((-1,))
             next_state, reward, terminal, info = self.eval_env.step(action)
             next_state = proc_state(next_state)
             states.append(state)
@@ -493,7 +500,7 @@ def train(args):
     obs_size = env.observation_space.shape[0]
     action_size = env.action_space.shape[0]
 
-    model = ActorCritic(obs_size, action_size, goal_space=1)
+    model = ActorCritic(obs_size, action_size)
     runner = A2C(env_name, model, args)
 
     if args.resume:
@@ -524,7 +531,7 @@ def train(args):
 
         if u % args.checkpt == 0:
 
-            mean_eval_return, max_eval_return, std_eval_return = runner.eval(20)
+            mean_eval_return, max_eval_return, std_eval_return = runner.eval(100)
             writer.add_scalar('eval_mean_return', mean_eval_return, total_num_steps)
             writer.add_scalar('eval_max_return', max_eval_return, total_num_steps)
             writer.add_scalar('eval_std_return', std_eval_return, total_num_steps)
